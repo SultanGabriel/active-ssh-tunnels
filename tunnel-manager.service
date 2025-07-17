@@ -1,0 +1,29 @@
+[Unit]
+Description=Chief Tunnel Officer - SSH Tunnel Manager
+After=network.target ssh.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=tunnel
+Group=tunnel
+WorkingDirectory=/opt/tunnel-manager
+ExecStart=/opt/tunnel-manager/tunnel_manager
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tunnel-manager/logs
+
+# Resource limits
+LimitNOFILE=1024
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

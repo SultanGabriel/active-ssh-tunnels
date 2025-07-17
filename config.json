@@ -1,0 +1,14 @@
+{
+  "tunnels": [
+    {
+      "name": "db-prod",
+      "host": "bigzappie.online",
+      "port": 22,
+      "user": "sultan",
+      "local_port": 3307,
+      "remote_host": "127.0.0.1",
+      "remote_port": 3306,
+      "reconnect_delay": 5
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+# Chief Tunnel Officer - Build & Dependencies
+# Logs directory
+logs/
+
+# Build artifacts
+*.o
+*.obj
+*.exe
+tunnel_manager
+tunnel_manager.exe
+
+# Editor files
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Runtime files
+*.pid
+*.lock
+
+# Backup files
+*.bak
+*.backup
+config.json.bak
