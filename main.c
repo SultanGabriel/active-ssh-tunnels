@@ -43,6 +43,7 @@ typedef enum {
     TUNNEL_RUNNING,
     TUNNEL_ERROR,
     TUNNEL_AUTH_ERROR,  // SSH key/authentication problems
+    TUNNEL_PORT_ERROR,  // Port already in use
     TUNNEL_RECONNECTING
 } tunnel_status_t;
 
@@ -199,12 +200,19 @@ void *tunnel_worker(void *arg) {
                           strstr(output_buffer, "Host key verification failed") ||
                           strstr(output_buffer, "No such file") ||
                           strstr(output_buffer, "Authentication failed") ||
-                          strstr(output_buffer, "Could not resolve hostname"))) {
+                          strstr(output_buffer, "Could not resolve hostname") ||
+                          strstr(output_buffer, "bind: Address already in use") ||
+                          strstr(output_buffer, "Permissions") ||
+                          strstr(output_buffer, "too open"))) {
             
             pthread_mutex_lock(&manager.mutex);
-            if (strstr(output_buffer, "Permission denied") || strstr(output_buffer, "Authentication failed")) {
+            if (strstr(output_buffer, "Permission denied") || strstr(output_buffer, "Authentication failed") || 
+                strstr(output_buffer, "Permissions") || strstr(output_buffer, "too open")) {
                 tunnel->status = TUNNEL_AUTH_ERROR;
                 log_tunnel_event(tunnel, "🔑 SSH authentication failed - check key and permissions");
+            } else if (strstr(output_buffer, "bind: Address already in use")) {
+                tunnel->status = TUNNEL_PORT_ERROR;
+                log_tunnel_event(tunnel, "🔒 Local port already in use - check for conflicting services");
             } else {
                 tunnel->status = TUNNEL_ERROR;
                 log_tunnel_event(tunnel, "❌ SSH connection failed - check host, port, and network");
@@ -350,12 +358,23 @@ int load_config(const char *filename) {
         tunnel->reconnect_delay = cJSON_IsNumber(reconnect_delay) ? 
                                  cJSON_GetNumberValue(reconnect_delay) : 5;
         
+        // Validate SSH key at startup
+        struct stat key_stat;
+        if (stat(tunnel->ssh_key, &key_stat) != 0) {
+            fprintf(stderr, "%s⚠️  Warning: SSH key '%s' for tunnel '%s' does not exist%s\n", 
+                   C_WARNING, tunnel->ssh_key, tunnel->name, C_RESET);
+        } else if ((key_stat.st_mode & 0777) > 0600) {
+            fprintf(stderr, "%s⚠️  Warning: SSH key '%s' for tunnel '%s' has loose permissions (%o, should be 600)%s\n", 
+                   C_WARNING, tunnel->ssh_key, tunnel->name, key_stat.st_mode & 0777, C_RESET);
+        }
+        
         // Open log file
         char log_path[256];
         snprintf(log_path, sizeof(log_path), "%s/%s.log", LOG_DIR, tunnel->name);
         tunnel->log = fopen(log_path, "a");
         if (!tunnel->log) {
-            fprintf(stderr, "Warning: Cannot open log file for tunnel '%s'\n", tunnel->name);
+            fprintf(stderr, "%s⚠️  Warning: Cannot open log file '%s' for tunnel '%s': %s%s\n", 
+                   C_WARNING, log_path, tunnel->name, strerror(errno), C_RESET);
         }
         
         tunnel->status = TUNNEL_STOPPED;
@@ -671,6 +690,7 @@ void print_status(void) {
         C_GREEN "RUNNING" C_RESET, 
         C_RED "ERROR" C_RESET, 
         C_MAGENTA "AUTH-ERROR" C_RESET,  // SSH key/auth problems
+        C_RED "PORT-ERROR" C_RESET,      // Port already in use
         C_YELLOW "RECONNECTING" C_RESET
     };
     
@@ -680,6 +700,7 @@ void print_status(void) {
         SYMBOL_RUNNING,
         SYMBOL_ERROR,
         "🔑",  // Key symbol for auth errors
+        "🔒",  // Lock symbol for port errors
         SYMBOL_RECONNECT
     };
     
@@ -708,6 +729,7 @@ void print_status(void) {
     int running_count = 0;
     int error_count = 0;
     int auth_error_count = 0;
+    int port_error_count = 0;
     
     for (int i = 0; i < manager.count; i++) {
         tunnel_t *tunnel = &manager.tunnels[i];
@@ -716,6 +738,7 @@ void print_status(void) {
         if (tunnel->status == TUNNEL_RUNNING) running_count++;
         if (tunnel->status == TUNNEL_ERROR) error_count++;
         if (tunnel->status == TUNNEL_AUTH_ERROR) auth_error_count++;
+        if (tunnel->status == TUNNEL_PORT_ERROR) port_error_count++;
         
         // Status symbol mit Farbe
         printf("%s %s%s%s ", 
@@ -750,11 +773,12 @@ void print_status(void) {
     
     // Summary bar
     printf("%s┌─ Summary ──────────────────────────────────────────────────────────────────┐%s\n", C_GREY, C_RESET);
-    printf("%s│%s %sRunning:%s %s%d%s  %sErrors:%s %s%d%s  %sAuth-Errors:%s %s%d%s  %sTotal:%s %s%d%s tunnels %s│%s\n", 
+    printf("%s│%s %sRunning:%s %s%d%s  %sErrors:%s %s%d%s  %sAuth:%s %s%d%s  %sPort:%s %s%d%s  %sTotal:%s %s%d%s %s│%s\n", 
            C_GREY, C_RESET,
            C_SUCCESS, C_RESET, C_BOLD, running_count, C_RESET,
            C_ERROR, C_RESET, C_BOLD, error_count, C_RESET,
            C_MAGENTA, C_RESET, C_BOLD, auth_error_count, C_RESET,
+           C_RED, C_RESET, C_BOLD, port_error_count, C_RESET,
            C_INFO, C_RESET, C_BOLD, manager.count, C_RESET,
            C_GREY, C_RESET);
     printf("%s└────────────────────────────────────────────────────────────────────────────┘%s\n\n", C_GREY, C_RESET);
@@ -767,10 +791,10 @@ void interactive_mode(void) {
     print_status();
     
     printf("%s=== Interactive Command Mode ===%s\n", C_BOLD, C_RESET);
-    printf("Commands: %sstatus%s, %sstart%s [name], %sstop%s [name], %sreset%s <name>, %sadd%s, %stest%s [name], %swatch%s, %squit%s, %shelp%s\n\n", 
+    printf("Commands: %sstatus%s, %sstart%s [name], %sstop%s [name], %sreset%s <name>, %sadd%s, %stest%s [name], %sdiagnose%s, %swatch%s, %squit%s, %shelp%s\n\n", 
            C_CYAN, C_RESET, C_GREEN, C_RESET, C_RED, C_RESET, 
            C_MAGENTA, C_RESET, C_BLUE, C_RESET, C_YELLOW, C_RESET,
-           C_YELLOW, C_RESET, C_MAGENTA, C_RESET, C_BLUE, C_RESET);
+           C_CYAN, C_RESET, C_YELLOW, C_RESET, C_MAGENTA, C_RESET, C_BLUE, C_RESET);
     
     while (manager.running) {
         printf("%stunnel%s> ", C_BOLD, C_RESET);
@@ -860,6 +884,7 @@ void interactive_mode(void) {
                             printf("%s⚠️  Tunnel '%s' is not running (status: %s)%s\n", 
                                    C_WARNING, tunnel->name, 
                                    tunnel->status == TUNNEL_AUTH_ERROR ? "AUTH-ERROR" :
+                                   tunnel->status == TUNNEL_PORT_ERROR ? "PORT-ERROR" :
                                    tunnel->status == TUNNEL_ERROR ? "ERROR" : "STOPPED", C_RESET);
                         }
                         break;
@@ -873,6 +898,46 @@ void interactive_mode(void) {
             } else {
                 printf("%s❌ Usage: test <tunnel_name>%s\n", C_ERROR, C_RESET);
             }
+        } else if (strcmp(input, "diagnose") == 0) {
+            printf("%s🔧 System Diagnostics%s\n\n", C_BOLD, C_RESET);
+            
+            // Check logs directory
+            struct stat logs_stat;
+            if (stat(LOG_DIR, &logs_stat) == 0) {
+                printf("%s✅ Logs directory '%s' exists and is accessible%s\n", C_SUCCESS, LOG_DIR, C_RESET);
+            } else {
+                printf("%s❌ Logs directory '%s' is not accessible: %s%s\n", C_ERROR, LOG_DIR, strerror(errno), C_RESET);
+            }
+            
+            // Check config file
+            struct stat config_stat;
+            if (stat(CONFIG_FILE, &config_stat) == 0) {
+                printf("%s✅ Config file '%s' exists and is readable%s\n", C_SUCCESS, CONFIG_FILE, C_RESET);
+            } else {
+                printf("%s❌ Config file '%s' is not accessible: %s%s\n", C_ERROR, CONFIG_FILE, strerror(errno), C_RESET);
+            }
+            
+            // Check all SSH keys
+            printf("\n%sTunnel SSH Key Status:%s\n", C_BOLD, C_RESET);
+            pthread_mutex_lock(&manager.mutex);
+            for (int i = 0; i < manager.count; i++) {
+                tunnel_t *tunnel = &manager.tunnels[i];
+                struct stat key_stat;
+                
+                printf("  %s%s%s: ", C_CYAN, tunnel->name, C_RESET);
+                if (stat(tunnel->ssh_key, &key_stat) == 0) {
+                    int perms = key_stat.st_mode & 0777;
+                    if (perms <= 0600) {
+                        printf("%s✅ Key exists, permissions OK (%o)%s\n", C_SUCCESS, perms, C_RESET);
+                    } else {
+                        printf("%s⚠️  Key exists but permissions too open (%o, should be 600)%s\n", C_WARNING, perms, C_RESET);
+                    }
+                } else {
+                    printf("%s❌ Key not found: %s%s\n", C_ERROR, tunnel->ssh_key, C_RESET);
+                }
+            }
+            pthread_mutex_unlock(&manager.mutex);
+            printf("\n");
         } else if (strcmp(input, "watch") == 0) {
             printf("%s🔄 Entering watch mode (press Ctrl+C to exit)...%s\n\n", C_INFO, C_RESET);
             while (manager.running) {
@@ -894,6 +959,7 @@ void interactive_mode(void) {
             printf("  %sadd%s          - Add new tunnel interactively\n", C_BLUE, C_RESET);
             printf("  %stest%s         - Test all tunnel connectivity\n", C_YELLOW, C_RESET);
             printf("  %stest <name>%s  - Test specific tunnel connectivity\n", C_YELLOW, C_RESET);
+            printf("  %sdiagnose%s     - Run system diagnostics\n", C_CYAN, C_RESET);
             printf("  %swatch%s        - Live status updates (refresh every 2s)\n", C_YELLOW, C_RESET);
             printf("  %squit%s         - Exit program\n", C_MAGENTA, C_RESET);
             printf("  %shelp%s         - Show this help\n\n", C_BLUE, C_RESET);
@@ -901,6 +967,7 @@ void interactive_mode(void) {
             printf("  start db-prod   %s# Start specific tunnel%s\n", C_DIM, C_RESET);
             printf("  stop web-dev    %s# Stop specific tunnel%s\n", C_DIM, C_RESET);
             printf("  test db-prod    %s# Test if tunnel is really working%s\n", C_DIM, C_RESET);
+            printf("  diagnose        %s# Check system health and SSH keys%s\n", C_DIM, C_RESET);
             printf("  reset api-test  %s# Restart tunnel with reset counter%s\n\n", C_DIM, C_RESET);
         } else if (strlen(input) > 0) {
             printf("%s❌ Unknown command: %s%s%s (type '%shelp%s' for commands)%s\n\n", 
