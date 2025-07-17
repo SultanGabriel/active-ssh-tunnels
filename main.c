@@ -47,12 +47,18 @@ typedef enum {
     TUNNEL_RECONNECTING
 } tunnel_status_t;
 
+typedef enum {
+    TUNNEL_TYPE_FORWARD = 0,  // -L (default) - Remote service accessible locally
+    TUNNEL_TYPE_REVERSE = 1   // -R - Local service accessible remotely
+} tunnel_type_t;
+
 typedef struct {
     char name[MAX_NAME_LEN];
     char host[MAX_HOST_LEN];
     int port;
     char user[MAX_NAME_LEN];
     char ssh_key[MAX_PATH_LEN];  // SSH private key file path
+    tunnel_type_t type;          // Forward (-L) or Reverse (-R)
     int local_port;
     char remote_host[MAX_HOST_LEN];
     int remote_port;
@@ -113,8 +119,15 @@ void log_tunnel_event(tunnel_t *tunnel, const char *event) {
 }
 
 int test_tunnel_connectivity(tunnel_t *tunnel) {
-    // Simple test: try to connect to the local port
-    // This is a basic check if the tunnel is actually forwarding
+    // Test connectivity based on tunnel type
+    if (tunnel->type == TUNNEL_TYPE_REVERSE) {
+        // For reverse tunnels, we can only test if the local service is running
+        // The remote port availability would need to be tested from the remote side
+        printf("%s🔧 Reverse tunnel test: Checking if local service on port %d is accessible%s\n", 
+               C_INFO, tunnel->local_port, C_RESET);
+    }
+    
+    // Simple test: try to connect to the relevant port
 #ifdef _WIN32
     SOCKET sock;
     struct sockaddr_in addr;
@@ -158,11 +171,20 @@ void *tunnel_worker(void *arg) {
         
         log_tunnel_event(tunnel, "🚀 Starting SSH tunnel");
         
-        // Build SSH command with proper key authentication and batch mode
-        snprintf(cmd, sizeof(cmd),
-                "ssh -i %s -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no 2>&1",
-                tunnel->ssh_key, tunnel->local_port, tunnel->remote_host, tunnel->remote_port,
-                tunnel->user, tunnel->host, tunnel->port);
+        // Build SSH command with Forward (-L) or Reverse (-R) tunneling
+        if (tunnel->type == TUNNEL_TYPE_REVERSE) {
+            // Reverse tunnel: Local service accessible on remote server
+            snprintf(cmd, sizeof(cmd),
+                    "ssh -i %s -N -R %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no 2>&1",
+                    tunnel->ssh_key, tunnel->remote_port, tunnel->remote_host, tunnel->local_port,
+                    tunnel->user, tunnel->host, tunnel->port);
+        } else {
+            // Forward tunnel: Remote service accessible locally (default)
+            snprintf(cmd, sizeof(cmd),
+                    "ssh -i %s -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no 2>&1",
+                    tunnel->ssh_key, tunnel->local_port, tunnel->remote_host, tunnel->remote_port,
+                    tunnel->user, tunnel->host, tunnel->port);
+        }
         
         log_tunnel_event(tunnel, "📡 Executing SSH command with BatchMode");
         
@@ -334,6 +356,7 @@ int load_config(const char *filename) {
         cJSON *port = cJSON_GetObjectItem(tunnel_json, "port");
         cJSON *user = cJSON_GetObjectItem(tunnel_json, "user");
         cJSON *ssh_key = cJSON_GetObjectItem(tunnel_json, "ssh_key");
+        cJSON *type = cJSON_GetObjectItem(tunnel_json, "type");
         cJSON *local_port = cJSON_GetObjectItem(tunnel_json, "local_port");
         cJSON *remote_host = cJSON_GetObjectItem(tunnel_json, "remote_host");
         cJSON *remote_port = cJSON_GetObjectItem(tunnel_json, "remote_port");
@@ -352,6 +375,19 @@ int load_config(const char *filename) {
         tunnel->port = cJSON_GetNumberValue(port);
         strncpy(tunnel->user, cJSON_GetStringValue(user), MAX_NAME_LEN - 1);
         strncpy(tunnel->ssh_key, cJSON_GetStringValue(ssh_key), MAX_PATH_LEN - 1);
+        
+        // Parse tunnel type (default: forward)
+        if (cJSON_IsString(type)) {
+            const char *type_str = cJSON_GetStringValue(type);
+            if (strcmp(type_str, "reverse") == 0) {
+                tunnel->type = TUNNEL_TYPE_REVERSE;
+            } else {
+                tunnel->type = TUNNEL_TYPE_FORWARD;  // default
+            }
+        } else {
+            tunnel->type = TUNNEL_TYPE_FORWARD;  // default if not specified
+        }
+        
         tunnel->local_port = cJSON_GetNumberValue(local_port);
         strncpy(tunnel->remote_host, cJSON_GetStringValue(remote_host), MAX_HOST_LEN - 1);
         tunnel->remote_port = cJSON_GetNumberValue(remote_port);
@@ -402,6 +438,7 @@ void save_config(const char *filename) {
         cJSON_AddStringToObject(tunnel_obj, "host", t->host);
         cJSON_AddNumberToObject(tunnel_obj, "port", t->port);
         cJSON_AddStringToObject(tunnel_obj, "ssh_key", t->ssh_key);
+        cJSON_AddStringToObject(tunnel_obj, "type", t->type == TUNNEL_TYPE_REVERSE ? "reverse" : "forward");
         cJSON_AddNumberToObject(tunnel_obj, "local_port", t->local_port);
         cJSON_AddStringToObject(tunnel_obj, "remote_host", t->remote_host);
         cJSON_AddNumberToObject(tunnel_obj, "remote_port", t->remote_port);
@@ -547,6 +584,8 @@ void reset_tunnel_by_name(const char *name) {
 void add_tunnel_interactive(void) {
     char name[MAX_NAME_LEN], user[MAX_NAME_LEN], host[MAX_HOST_LEN], remote_host[MAX_HOST_LEN];
     char ssh_key[MAX_PATH_LEN];
+    char type_input[16];
+    tunnel_type_t tunnel_type = TUNNEL_TYPE_FORWARD;  // default
     int port, local_port, remote_port, reconnect_delay = 5;
     char input_buffer[256];
     
@@ -582,17 +621,42 @@ void add_tunnel_interactive(void) {
     fgets(ssh_key, sizeof(ssh_key), stdin);
     ssh_key[strcspn(ssh_key, "\n")] = 0;
     
+    printf("\n%s📡 Tunnel Type Selection:%s\n", C_BOLD, C_RESET);
+    printf("  %s[F]orward%s - Remote service accessible locally (ssh -L)\n", C_GREEN, C_RESET);
+    printf("  %s[R]everse%s - Local service accessible remotely (ssh -R)\n", C_MAGENTA, C_RESET);
+    printf("%sTunnel type [F/r]:%s ", C_CYAN, C_RESET);
+    fgets(type_input, sizeof(type_input), stdin);
+    type_input[strcspn(type_input, "\n")] = 0;
+    
+    if (type_input[0] == 'r' || type_input[0] == 'R') {
+        tunnel_type = TUNNEL_TYPE_REVERSE;
+        printf("%s✅ Selected: Reverse tunnel (local→remote)%s\n\n", C_MAGENTA, C_RESET);
+    } else {
+        tunnel_type = TUNNEL_TYPE_FORWARD;
+        printf("%s✅ Selected: Forward tunnel (remote→local)%s\n\n", C_GREEN, C_RESET);
+    }
+    
     printf("%sLocal port:%s ", C_CYAN, C_RESET);
     fgets(input_buffer, sizeof(input_buffer), stdin);
     local_port = atoi(input_buffer);
     
-    printf("%sRemote host:%s ", C_CYAN, C_RESET);
-    fgets(remote_host, sizeof(remote_host), stdin);
-    remote_host[strcspn(remote_host, "\n")] = 0;
-    
-    printf("%sRemote port:%s ", C_CYAN, C_RESET);
-    fgets(input_buffer, sizeof(input_buffer), stdin);
-    remote_port = atoi(input_buffer);
+    if (tunnel_type == TUNNEL_TYPE_REVERSE) {
+        printf("%sRemote port (will be opened on %s%s%s):%s ", C_CYAN, C_BOLD, host, C_RESET, C_RESET);
+    } else {
+        printf("%sRemote host:%s ", C_CYAN, C_RESET);
+    }
+    if (tunnel_type == TUNNEL_TYPE_REVERSE) {
+        fgets(input_buffer, sizeof(input_buffer), stdin);
+        remote_port = atoi(input_buffer);
+        strcpy(remote_host, "127.0.0.1");  // For reverse tunnels, always localhost
+    } else {
+        fgets(remote_host, sizeof(remote_host), stdin);
+        remote_host[strcspn(remote_host, "\n")] = 0;
+        
+        printf("%sRemote port:%s ", C_CYAN, C_RESET);
+        fgets(input_buffer, sizeof(input_buffer), stdin);
+        remote_port = atoi(input_buffer);
+    }
     
     printf("%sReconnect delay (s) [%d]:%s ", C_CYAN, reconnect_delay, C_RESET);
     fgets(input_buffer, sizeof(input_buffer), stdin);
@@ -651,6 +715,7 @@ void add_tunnel_interactive(void) {
     strncpy(tunnel->host, host, MAX_HOST_LEN - 1);
     tunnel->port = port;
     strncpy(tunnel->ssh_key, ssh_key, MAX_PATH_LEN - 1);
+    tunnel->type = tunnel_type;
     tunnel->local_port = local_port;
     strncpy(tunnel->remote_host, remote_host, MAX_HOST_LEN - 1);
     tunnel->remote_port = remote_port;
@@ -745,16 +810,36 @@ void print_status(void) {
                status_symbols[tunnel->status],
                C_BOLD, tunnel->name, C_RESET);
                
+        // Tunnel type indicator
+        const char *type_symbol = (tunnel->type == TUNNEL_TYPE_REVERSE) ? "⬅️" : "➡️";
+        const char *type_text = (tunnel->type == TUNNEL_TYPE_REVERSE) ? "REVERSE" : "FORWARD";
+        
         // Connection info
-        printf("%s%s%s@%s%s%s:%s%d%s %s%s%s localhost:%s%d%s %s%s%s %s%s%s:%s%d%s\n",
-               C_DIM, tunnel->user, C_RESET,
-               C_BLUE, tunnel->host, C_RESET,
-               C_DIM, tunnel->port, C_RESET,
-               C_YELLOW, SYMBOL_ARROW, C_RESET,
-               C_GREEN, tunnel->local_port, C_RESET,
-               C_YELLOW, SYMBOL_ARROW, C_RESET,
-               C_BLUE, tunnel->remote_host, C_RESET,
-               C_DIM, tunnel->remote_port, C_RESET);
+        if (tunnel->type == TUNNEL_TYPE_REVERSE) {
+            // Reverse: Local service accessible remotely
+            printf("%s%s%s@%s%s%s:%s%d%s %s%s%s %s%s%s:%s%d%s %s%s%s localhost:%s%d%s %s[%s]%s\n",
+                   C_DIM, tunnel->user, C_RESET,
+                   C_BLUE, tunnel->host, C_RESET,
+                   C_DIM, tunnel->port, C_RESET,
+                   C_YELLOW, SYMBOL_ARROW, C_RESET,
+                   C_GREEN, tunnel->host, C_RESET,
+                   C_GREEN, tunnel->remote_port, C_RESET,
+                   C_YELLOW, SYMBOL_ARROW, C_RESET,
+                   C_BLUE, tunnel->local_port, C_RESET,
+                   C_DIM, type_text, C_RESET);
+        } else {
+            // Forward: Remote service accessible locally
+            printf("%s%s%s@%s%s%s:%s%d%s %s%s%s localhost:%s%d%s %s%s%s %s%s%s:%s%d%s %s[%s]%s\n",
+                   C_DIM, tunnel->user, C_RESET,
+                   C_BLUE, tunnel->host, C_RESET,
+                   C_DIM, tunnel->port, C_RESET,
+                   C_YELLOW, SYMBOL_ARROW, C_RESET,
+                   C_GREEN, tunnel->local_port, C_RESET,
+                   C_YELLOW, SYMBOL_ARROW, C_RESET,
+                   C_BLUE, tunnel->remote_host, C_RESET,
+                   C_DIM, tunnel->remote_port, C_RESET,
+                   C_DIM, type_text, C_RESET);
+        }
                
         // Status details mit schöner Formatierung
         printf("   Status: %s | Restarts: %s%d%s | Delay: %s%ds%s",
@@ -969,6 +1054,12 @@ void interactive_mode(void) {
             printf("  test db-prod    %s# Test if tunnel is really working%s\n", C_DIM, C_RESET);
             printf("  diagnose        %s# Check system health and SSH keys%s\n", C_DIM, C_RESET);
             printf("  reset api-test  %s# Restart tunnel with reset counter%s\n\n", C_DIM, C_RESET);
+            
+            printf("%s🔄 Tunnel Types:%s\n", C_BOLD, C_RESET);
+            printf("  %sForward (-L):%s Remote service → Local access\n", C_GREEN, C_RESET);
+            printf("  %sReverse (-R):%s Local service → Remote access\n", C_MAGENTA, C_RESET);
+            printf("  %sExample:%s ssh -R 6983:127.0.0.1:2283 user@server\n", C_DIM, C_RESET);
+            printf("           %s# Opens port 6983 on server, forwards to local 2283%s\n\n", C_DIM, C_RESET);
         } else if (strlen(input) > 0) {
             printf("%s❌ Unknown command: %s%s%s (type '%shelp%s' for commands)%s\n\n", 
                    C_ERROR, C_BOLD, input, C_RESET, C_BLUE, C_RESET, C_RESET);
