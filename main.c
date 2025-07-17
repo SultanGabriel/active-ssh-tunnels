@@ -14,12 +14,16 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #define sleep(x) Sleep((x) * 1000)
 #define popen _popen
 #define pclose _pclose
 #define mkdir(path, mode) _mkdir(path)
 #else
 #include <ncurses.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #endif
 
 #include "cjson/cJSON.h"
@@ -87,6 +91,7 @@ void add_tunnel_interactive(void);
 void print_status(void);
 void interactive_mode(void);
 void log_tunnel_event(tunnel_t *tunnel, const char *event);
+int test_tunnel_connectivity(tunnel_t *tunnel);
 
 void log_tunnel_event(tunnel_t *tunnel, const char *event) {
     if (!tunnel->log) return;
@@ -106,10 +111,42 @@ void log_tunnel_event(tunnel_t *tunnel, const char *event) {
             C_CYAN, tunnel->name, C_RESET, event);
 }
 
+int test_tunnel_connectivity(tunnel_t *tunnel) {
+    // Simple test: try to connect to the local port
+    // This is a basic check if the tunnel is actually forwarding
+#ifdef _WIN32
+    SOCKET sock;
+    struct sockaddr_in addr;
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) return 0;
+    
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(tunnel->local_port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    
+    int result = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    closesocket(sock);
+    return (result == 0);
+#else
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return 0;
+    
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(tunnel->local_port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    
+    int result = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    close(sock);
+    return (result == 0);
+#endif
+}
+
 void *tunnel_worker(void *arg) {
     tunnel_t *tunnel = (tunnel_t *)arg;
     char cmd[MAX_CMD_LEN];
     FILE *ssh_proc = NULL;
+    char output_buffer[512];
     
     while (tunnel->should_run && manager.running) {
         pthread_mutex_lock(&manager.mutex);
@@ -122,7 +159,7 @@ void *tunnel_worker(void *arg) {
         
         // Build SSH command with proper key authentication and batch mode
         snprintf(cmd, sizeof(cmd),
-                "ssh -i %s -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes 2>&1",
+                "ssh -i %s -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no 2>&1",
                 tunnel->ssh_key, tunnel->local_port, tunnel->remote_host, tunnel->remote_port,
                 tunnel->user, tunnel->host, tunnel->port);
         
@@ -140,13 +177,53 @@ void *tunnel_worker(void *arg) {
             continue;
         }
         
+        // Give SSH a moment to establish the connection
+        sleep(2);
+        
+        // Read initial output to check for immediate errors
+        int has_output = 0;
+        if (fgets(output_buffer, sizeof(output_buffer), ssh_proc)) {
+            has_output = 1;
+            // Log the SSH output for debugging
+            output_buffer[strcspn(output_buffer, "\r\n")] = 0; // Remove newlines
+            if (strlen(output_buffer) > 0) {
+                char log_msg[1024];
+                snprintf(log_msg, sizeof(log_msg), "🔍 SSH output: %s", output_buffer);
+                log_tunnel_event(tunnel, log_msg);
+            }
+        }
+        
+        // If we got immediate output, it's likely an error
+        if (has_output && (strstr(output_buffer, "Permission denied") || 
+                          strstr(output_buffer, "Connection refused") ||
+                          strstr(output_buffer, "Host key verification failed") ||
+                          strstr(output_buffer, "No such file") ||
+                          strstr(output_buffer, "Authentication failed") ||
+                          strstr(output_buffer, "Could not resolve hostname"))) {
+            
+            pthread_mutex_lock(&manager.mutex);
+            if (strstr(output_buffer, "Permission denied") || strstr(output_buffer, "Authentication failed")) {
+                tunnel->status = TUNNEL_AUTH_ERROR;
+                log_tunnel_event(tunnel, "🔑 SSH authentication failed - check key and permissions");
+            } else {
+                tunnel->status = TUNNEL_ERROR;
+                log_tunnel_event(tunnel, "❌ SSH connection failed - check host, port, and network");
+            }
+            pthread_mutex_unlock(&manager.mutex);
+            
+            pclose(ssh_proc);
+            ssh_proc = NULL;
+            sleep(tunnel->reconnect_delay);
+            continue;
+        }
+        
         pthread_mutex_lock(&manager.mutex);
         tunnel->status = TUNNEL_RUNNING;
         pthread_mutex_unlock(&manager.mutex);
         
         log_tunnel_event(tunnel, "✅ Tunnel established successfully");
         
-        // Wait for process to exit
+        // Wait for process to exit (this blocks until SSH dies)
         int exit_code = pclose(ssh_proc);
         ssh_proc = NULL;
         
@@ -690,10 +767,10 @@ void interactive_mode(void) {
     print_status();
     
     printf("%s=== Interactive Command Mode ===%s\n", C_BOLD, C_RESET);
-    printf("Commands: %sstatus%s, %sstart%s [name], %sstop%s [name], %sreset%s <name>, %sadd%s, %swatch%s, %squit%s, %shelp%s\n\n", 
+    printf("Commands: %sstatus%s, %sstart%s [name], %sstop%s [name], %sreset%s <name>, %sadd%s, %stest%s [name], %swatch%s, %squit%s, %shelp%s\n\n", 
            C_CYAN, C_RESET, C_GREEN, C_RESET, C_RED, C_RESET, 
-           C_MAGENTA, C_RESET, C_BLUE, C_RESET, C_YELLOW, C_RESET, 
-           C_MAGENTA, C_RESET, C_BLUE, C_RESET);
+           C_MAGENTA, C_RESET, C_BLUE, C_RESET, C_YELLOW, C_RESET,
+           C_YELLOW, C_RESET, C_MAGENTA, C_RESET, C_BLUE, C_RESET);
     
     while (manager.running) {
         printf("%stunnel%s> ", C_BOLD, C_RESET);
@@ -743,6 +820,59 @@ void interactive_mode(void) {
             }
         } else if (strcmp(input, "add") == 0) {
             add_tunnel_interactive();
+        } else if (strcmp(input, "test") == 0) {
+            printf("%s🔧 Testing all tunnel connectivity...%s\n", C_INFO, C_RESET);
+            pthread_mutex_lock(&manager.mutex);
+            for (int i = 0; i < manager.count; i++) {
+                tunnel_t *tunnel = &manager.tunnels[i];
+                if (tunnel->status == TUNNEL_RUNNING) {
+                    if (test_tunnel_connectivity(tunnel)) {
+                        printf("%s✅ Tunnel '%s' is working (port %d accessible)%s\n", 
+                               C_SUCCESS, tunnel->name, tunnel->local_port, C_RESET);
+                    } else {
+                        printf("%s❌ Tunnel '%s' appears broken (port %d not accessible)%s\n", 
+                               C_ERROR, tunnel->name, tunnel->local_port, C_RESET);
+                    }
+                } else {
+                    printf("%s⚠️  Tunnel '%s' is not running%s\n", C_WARNING, tunnel->name, C_RESET);
+                }
+            }
+            pthread_mutex_unlock(&manager.mutex);
+        } else if (strncmp(input, "test ", 5) == 0) {
+            char *name = input + 5;
+            while (*name == ' ') name++; // Skip leading spaces
+            if (strlen(name) > 0) {
+                pthread_mutex_lock(&manager.mutex);
+                int found = 0;
+                for (int i = 0; i < manager.count; i++) {
+                    tunnel_t *tunnel = &manager.tunnels[i];
+                    if (strcmp(tunnel->name, name) == 0) {
+                        found = 1;
+                        if (tunnel->status == TUNNEL_RUNNING) {
+                            if (test_tunnel_connectivity(tunnel)) {
+                                printf("%s✅ Tunnel '%s' is working (port %d accessible)%s\n", 
+                                       C_SUCCESS, tunnel->name, tunnel->local_port, C_RESET);
+                            } else {
+                                printf("%s❌ Tunnel '%s' appears broken (port %d not accessible)%s\n", 
+                                       C_ERROR, tunnel->name, tunnel->local_port, C_RESET);
+                            }
+                        } else {
+                            printf("%s⚠️  Tunnel '%s' is not running (status: %s)%s\n", 
+                                   C_WARNING, tunnel->name, 
+                                   tunnel->status == TUNNEL_AUTH_ERROR ? "AUTH-ERROR" :
+                                   tunnel->status == TUNNEL_ERROR ? "ERROR" : "STOPPED", C_RESET);
+                        }
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&manager.mutex);
+                
+                if (!found) {
+                    printf("%s❌ Tunnel '%s' not found%s\n", C_ERROR, name, C_RESET);
+                }
+            } else {
+                printf("%s❌ Usage: test <tunnel_name>%s\n", C_ERROR, C_RESET);
+            }
         } else if (strcmp(input, "watch") == 0) {
             printf("%s🔄 Entering watch mode (press Ctrl+C to exit)...%s\n\n", C_INFO, C_RESET);
             while (manager.running) {
@@ -762,12 +892,15 @@ void interactive_mode(void) {
             printf("  %sstop <name>%s  - Stop specific tunnel\n", C_RED, C_RESET);
             printf("  %sreset <name>%s - Restart specific tunnel\n", C_MAGENTA, C_RESET);
             printf("  %sadd%s          - Add new tunnel interactively\n", C_BLUE, C_RESET);
+            printf("  %stest%s         - Test all tunnel connectivity\n", C_YELLOW, C_RESET);
+            printf("  %stest <name>%s  - Test specific tunnel connectivity\n", C_YELLOW, C_RESET);
             printf("  %swatch%s        - Live status updates (refresh every 2s)\n", C_YELLOW, C_RESET);
             printf("  %squit%s         - Exit program\n", C_MAGENTA, C_RESET);
             printf("  %shelp%s         - Show this help\n\n", C_BLUE, C_RESET);
             printf("%s💡 Examples:%s\n", C_BOLD, C_RESET);
             printf("  start db-prod   %s# Start specific tunnel%s\n", C_DIM, C_RESET);
             printf("  stop web-dev    %s# Stop specific tunnel%s\n", C_DIM, C_RESET);
+            printf("  test db-prod    %s# Test if tunnel is really working%s\n", C_DIM, C_RESET);
             printf("  reset api-test  %s# Restart tunnel with reset counter%s\n\n", C_DIM, C_RESET);
         } else if (strlen(input) > 0) {
             printf("%s❌ Unknown command: %s%s%s (type '%shelp%s' for commands)%s\n\n", 
