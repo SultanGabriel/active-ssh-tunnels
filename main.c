@@ -38,6 +38,7 @@ typedef enum {
     TUNNEL_STARTING,
     TUNNEL_RUNNING,
     TUNNEL_ERROR,
+    TUNNEL_AUTH_ERROR,  // SSH key/authentication problems
     TUNNEL_RECONNECTING
 } tunnel_status_t;
 
@@ -119,13 +120,13 @@ void *tunnel_worker(void *arg) {
         
         log_tunnel_event(tunnel, "🚀 Starting SSH tunnel");
         
-        // Build SSH command with SSH key authentication
+        // Build SSH command with proper key authentication and batch mode
         snprintf(cmd, sizeof(cmd),
-                "ssh -i %s -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes",
+                "ssh -i %s -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes 2>&1",
                 tunnel->ssh_key, tunnel->local_port, tunnel->remote_host, tunnel->remote_port,
                 tunnel->user, tunnel->host, tunnel->port);
         
-        log_tunnel_event(tunnel, "📡 Executing SSH command");
+        log_tunnel_event(tunnel, "📡 Executing SSH command with BatchMode");
         
         // Start SSH process
         ssh_proc = popen(cmd, "r");
@@ -148,6 +149,23 @@ void *tunnel_worker(void *arg) {
         // Wait for process to exit
         int exit_code = pclose(ssh_proc);
         ssh_proc = NULL;
+        
+        // Check if SSH failed (key problems, auth issues, etc.)
+        if (exit_code != 0) {
+            pthread_mutex_lock(&manager.mutex);
+            // Exit code 255 usually indicates SSH authentication/connection failure
+            if (exit_code == 255) {
+                tunnel->status = TUNNEL_AUTH_ERROR;
+                log_tunnel_event(tunnel, "🔑 SSH authentication failed (check key, permissions, host access)");
+            } else {
+                tunnel->status = TUNNEL_ERROR;
+                log_tunnel_event(tunnel, "❌ SSH process exited with error (check configuration)");
+            }
+            pthread_mutex_unlock(&manager.mutex);
+            
+            sleep(tunnel->reconnect_delay);
+            continue;
+        }
         
         pthread_mutex_lock(&manager.mutex);
         tunnel->status = tunnel->should_run ? TUNNEL_RECONNECTING : TUNNEL_STOPPED;
@@ -494,6 +512,30 @@ void add_tunnel_interactive(void) {
         return;
     }
     
+    // Check if SSH key file exists and has proper permissions
+    struct stat key_stat;
+    if (stat(ssh_key, &key_stat) != 0) {
+        printf("%s❌ SSH key file '%s' does not exist%s\n", C_ERROR, ssh_key, C_RESET);
+        return;
+    }
+    
+    // Check permissions (should be 600 or 400 for private keys)
+    if ((key_stat.st_mode & 0777) > 0600) {
+        printf("%s⚠️  Warning: SSH key '%s' has loose permissions (should be 600)%s\n", 
+               C_WARNING, ssh_key, C_RESET);
+        printf("%sFile permissions: %o (should be 600 for security)%s\n", 
+               C_DIM, key_stat.st_mode & 0777, C_RESET);
+        printf("%sContinue anyway? [y/N]:%s ", C_YELLOW, C_RESET);
+        
+        char confirm[16];
+        fgets(confirm, sizeof(confirm), stdin);
+        if (confirm[0] != 'y' && confirm[0] != 'Y') {
+            printf("%s❌ Tunnel not added. Fix key permissions first: chmod 600 %s%s\n", 
+                   C_ERROR, ssh_key, C_RESET);
+            return;
+        }
+    }
+    
     // Check for duplicate names
     pthread_mutex_lock(&manager.mutex);
     for (int i = 0; i < manager.count; i++) {
@@ -551,6 +593,7 @@ void print_status(void) {
         C_YELLOW "STARTING" C_RESET, 
         C_GREEN "RUNNING" C_RESET, 
         C_RED "ERROR" C_RESET, 
+        C_MAGENTA "AUTH-ERROR" C_RESET,  // SSH key/auth problems
         C_YELLOW "RECONNECTING" C_RESET
     };
     
@@ -559,6 +602,7 @@ void print_status(void) {
         SYMBOL_STARTING,
         SYMBOL_RUNNING,
         SYMBOL_ERROR,
+        "🔑",  // Key symbol for auth errors
         SYMBOL_RECONNECT
     };
     
@@ -586,6 +630,7 @@ void print_status(void) {
     
     int running_count = 0;
     int error_count = 0;
+    int auth_error_count = 0;
     
     for (int i = 0; i < manager.count; i++) {
         tunnel_t *tunnel = &manager.tunnels[i];
@@ -593,6 +638,7 @@ void print_status(void) {
         // Count status
         if (tunnel->status == TUNNEL_RUNNING) running_count++;
         if (tunnel->status == TUNNEL_ERROR) error_count++;
+        if (tunnel->status == TUNNEL_AUTH_ERROR) auth_error_count++;
         
         // Status symbol mit Farbe
         printf("%s %s%s%s ", 
@@ -627,10 +673,11 @@ void print_status(void) {
     
     // Summary bar
     printf("%s┌─ Summary ──────────────────────────────────────────────────────────────────┐%s\n", C_GREY, C_RESET);
-    printf("%s│%s %sRunning:%s %s%d%s  %sErrors:%s %s%d%s  %sTotal:%s %s%d%s tunnels %s│%s\n", 
+    printf("%s│%s %sRunning:%s %s%d%s  %sErrors:%s %s%d%s  %sAuth-Errors:%s %s%d%s  %sTotal:%s %s%d%s tunnels %s│%s\n", 
            C_GREY, C_RESET,
            C_SUCCESS, C_RESET, C_BOLD, running_count, C_RESET,
            C_ERROR, C_RESET, C_BOLD, error_count, C_RESET,
+           C_MAGENTA, C_RESET, C_BOLD, auth_error_count, C_RESET,
            C_INFO, C_RESET, C_BOLD, manager.count, C_RESET,
            C_GREY, C_RESET);
     printf("%s└────────────────────────────────────────────────────────────────────────────┘%s\n\n", C_GREY, C_RESET);
