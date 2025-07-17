@@ -31,6 +31,7 @@
 #define MAX_CMD_LEN 512
 #define MAX_NAME_LEN 64
 #define MAX_HOST_LEN 128
+#define MAX_PATH_LEN 256
 
 typedef enum {
     TUNNEL_STOPPED = 0,
@@ -45,6 +46,7 @@ typedef struct {
     char host[MAX_HOST_LEN];
     int port;
     char user[MAX_NAME_LEN];
+    char ssh_key[MAX_PATH_LEN];  // SSH private key file path
     int local_port;
     char remote_host[MAX_HOST_LEN];
     int remote_port;
@@ -117,10 +119,10 @@ void *tunnel_worker(void *arg) {
         
         log_tunnel_event(tunnel, "🚀 Starting SSH tunnel");
         
-        // Build SSH command
+        // Build SSH command with SSH key authentication
         snprintf(cmd, sizeof(cmd),
-                "ssh -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30",
-                tunnel->local_port, tunnel->remote_host, tunnel->remote_port,
+                "ssh -i %s -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes",
+                tunnel->ssh_key, tunnel->local_port, tunnel->remote_host, tunnel->remote_port,
                 tunnel->user, tunnel->host, tunnel->port);
         
         log_tunnel_event(tunnel, "📡 Executing SSH command");
@@ -228,6 +230,7 @@ int load_config(const char *filename) {
         cJSON *host = cJSON_GetObjectItem(tunnel_json, "host");
         cJSON *port = cJSON_GetObjectItem(tunnel_json, "port");
         cJSON *user = cJSON_GetObjectItem(tunnel_json, "user");
+        cJSON *ssh_key = cJSON_GetObjectItem(tunnel_json, "ssh_key");
         cJSON *local_port = cJSON_GetObjectItem(tunnel_json, "local_port");
         cJSON *remote_host = cJSON_GetObjectItem(tunnel_json, "remote_host");
         cJSON *remote_port = cJSON_GetObjectItem(tunnel_json, "remote_port");
@@ -235,8 +238,8 @@ int load_config(const char *filename) {
         
         if (!cJSON_IsString(name) || !cJSON_IsString(host) || 
             !cJSON_IsNumber(port) || !cJSON_IsString(user) ||
-            !cJSON_IsNumber(local_port) || !cJSON_IsString(remote_host) ||
-            !cJSON_IsNumber(remote_port)) {
+            !cJSON_IsString(ssh_key) || !cJSON_IsNumber(local_port) || 
+            !cJSON_IsString(remote_host) || !cJSON_IsNumber(remote_port)) {
             fprintf(stderr, "Error: Invalid tunnel configuration at index %d\n", i);
             continue;
         }
@@ -245,6 +248,7 @@ int load_config(const char *filename) {
         strncpy(tunnel->host, cJSON_GetStringValue(host), MAX_HOST_LEN - 1);
         tunnel->port = cJSON_GetNumberValue(port);
         strncpy(tunnel->user, cJSON_GetStringValue(user), MAX_NAME_LEN - 1);
+        strncpy(tunnel->ssh_key, cJSON_GetStringValue(ssh_key), MAX_PATH_LEN - 1);
         tunnel->local_port = cJSON_GetNumberValue(local_port);
         strncpy(tunnel->remote_host, cJSON_GetStringValue(remote_host), MAX_HOST_LEN - 1);
         tunnel->remote_port = cJSON_GetNumberValue(remote_port);
@@ -283,6 +287,7 @@ void save_config(const char *filename) {
         cJSON_AddStringToObject(tunnel_obj, "user", t->user);
         cJSON_AddStringToObject(tunnel_obj, "host", t->host);
         cJSON_AddNumberToObject(tunnel_obj, "port", t->port);
+        cJSON_AddStringToObject(tunnel_obj, "ssh_key", t->ssh_key);
         cJSON_AddNumberToObject(tunnel_obj, "local_port", t->local_port);
         cJSON_AddStringToObject(tunnel_obj, "remote_host", t->remote_host);
         cJSON_AddNumberToObject(tunnel_obj, "remote_port", t->remote_port);
@@ -427,6 +432,7 @@ void reset_tunnel_by_name(const char *name) {
 
 void add_tunnel_interactive(void) {
     char name[MAX_NAME_LEN], user[MAX_NAME_LEN], host[MAX_HOST_LEN], remote_host[MAX_HOST_LEN];
+    char ssh_key[MAX_PATH_LEN];
     int port, local_port, remote_port, reconnect_delay = 5;
     char input_buffer[256];
     
@@ -458,6 +464,10 @@ void add_tunnel_interactive(void) {
     fgets(input_buffer, sizeof(input_buffer), stdin);
     port = atoi(input_buffer);
     
+    printf("%sSSH private key path:%s ", C_CYAN, C_RESET);
+    fgets(ssh_key, sizeof(ssh_key), stdin);
+    ssh_key[strcspn(ssh_key, "\n")] = 0;
+    
     printf("%sLocal port:%s ", C_CYAN, C_RESET);
     fgets(input_buffer, sizeof(input_buffer), stdin);
     local_port = atoi(input_buffer);
@@ -478,7 +488,8 @@ void add_tunnel_interactive(void) {
     
     // Validate input
     if (strlen(name) == 0 || strlen(user) == 0 || strlen(host) == 0 || 
-        strlen(remote_host) == 0 || port <= 0 || local_port <= 0 || remote_port <= 0) {
+        strlen(ssh_key) == 0 || strlen(remote_host) == 0 || 
+        port <= 0 || local_port <= 0 || remote_port <= 0) {
         printf("%s❌ Invalid input. Tunnel not added.%s\n", C_ERROR, C_RESET);
         return;
     }
@@ -501,6 +512,7 @@ void add_tunnel_interactive(void) {
     strncpy(tunnel->user, user, MAX_NAME_LEN - 1);
     strncpy(tunnel->host, host, MAX_HOST_LEN - 1);
     tunnel->port = port;
+    strncpy(tunnel->ssh_key, ssh_key, MAX_PATH_LEN - 1);
     tunnel->local_port = local_port;
     strncpy(tunnel->remote_host, remote_host, MAX_HOST_LEN - 1);
     tunnel->remote_port = remote_port;

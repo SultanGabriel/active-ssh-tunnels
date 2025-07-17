@@ -5,6 +5,7 @@
       "host": "bigzappie.online",
       "port": 22,
       "user": "sultan",
+      "ssh_key": "/home/USER/.ssh/id_rsa",
       "local_port": 3307,
       "remote_host": "127.0.0.1",
       "remote_port": 3306,
