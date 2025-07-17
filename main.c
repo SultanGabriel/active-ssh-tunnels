@@ -205,42 +205,105 @@ void *tunnel_worker(void *arg) {
         
         // Read initial output to check for immediate errors
         int has_output = 0;
-        if (fgets(output_buffer, sizeof(output_buffer), ssh_proc)) {
+        char all_output[1024] = {0};  // Collect all output for better debugging
+        
+        while (fgets(output_buffer, sizeof(output_buffer), ssh_proc)) {
             has_output = 1;
-            // Log the SSH output for debugging
             output_buffer[strcspn(output_buffer, "\r\n")] = 0; // Remove newlines
             if (strlen(output_buffer) > 0) {
+                // Append to all_output for logging
+                if (strlen(all_output) + strlen(output_buffer) < sizeof(all_output) - 10) {
+                    if (strlen(all_output) > 0) strcat(all_output, " | ");
+                    strcat(all_output, output_buffer);
+                }
+                
                 char log_msg[1024];
                 snprintf(log_msg, sizeof(log_msg), "🔍 SSH output: %s", output_buffer);
                 log_tunnel_event(tunnel, log_msg);
             }
         }
         
+        // Log complete output for reverse tunnel debugging
+        if (has_output && tunnel->type == TUNNEL_TYPE_REVERSE) {
+            char debug_msg[1536];
+            snprintf(debug_msg, sizeof(debug_msg), "🔧 Complete SSH output for reverse tunnel: %s", all_output);
+            log_tunnel_event(tunnel, debug_msg);
+        }
+        
         // If we got immediate output, it's likely an error
-        if (has_output && (strstr(output_buffer, "Permission denied") || 
-                          strstr(output_buffer, "Connection refused") ||
-                          strstr(output_buffer, "Host key verification failed") ||
-                          strstr(output_buffer, "No such file") ||
-                          strstr(output_buffer, "Authentication failed") ||
-                          strstr(output_buffer, "Could not resolve hostname") ||
-                          strstr(output_buffer, "bind: Address already in use") ||
-                          strstr(output_buffer, "Permissions") ||
-                          strstr(output_buffer, "too open"))) {
+        if (has_output && (strstr(all_output, "Permission denied") || 
+                          strstr(all_output, "Connection refused") ||
+                          strstr(all_output, "Host key verification failed") ||
+                          strstr(all_output, "No such file") ||
+                          strstr(all_output, "Authentication failed") ||
+                          strstr(all_output, "Could not resolve hostname") ||
+                          strstr(all_output, "bind: Address already in use") ||
+                          strstr(all_output, "Permissions") ||
+                          strstr(all_output, "too open") ||
+                          strstr(all_output, "remote port forwarding failed") ||
+                          strstr(all_output, "Warning: remote port forwarding failed") ||
+                          strstr(all_output, "cannot listen to port") ||
+                          strstr(all_output, "bind: Cannot assign requested address"))) {
             
             pthread_mutex_lock(&manager.mutex);
-            if (strstr(output_buffer, "Permission denied") || strstr(output_buffer, "Authentication failed") || 
-                strstr(output_buffer, "Permissions") || strstr(output_buffer, "too open")) {
+            if (strstr(all_output, "Permission denied") || strstr(all_output, "Authentication failed") || 
+                strstr(all_output, "Permissions") || strstr(all_output, "too open")) {
                 tunnel->status = TUNNEL_AUTH_ERROR;
                 log_tunnel_event(tunnel, "🔑 SSH authentication failed - check key and permissions");
-            } else if (strstr(output_buffer, "bind: Address already in use")) {
+            } else if (strstr(all_output, "bind: Address already in use") || 
+                      strstr(all_output, "remote port forwarding failed") ||
+                      strstr(all_output, "Warning: remote port forwarding failed") ||
+                      strstr(all_output, "cannot listen to port") ||
+                      strstr(all_output, "bind: Cannot assign requested address")) {
                 tunnel->status = TUNNEL_PORT_ERROR;
-                log_tunnel_event(tunnel, "🔒 Local port already in use - check for conflicting services");
+                if (tunnel->type == TUNNEL_TYPE_REVERSE) {
+                    log_tunnel_event(tunnel, "🔒 Remote port forwarding failed - check GatewayPorts setting and port availability on server");
+                } else {
+                    log_tunnel_event(tunnel, "🔒 Local port already in use - check for conflicting services");
+                }
             } else {
                 tunnel->status = TUNNEL_ERROR;
                 log_tunnel_event(tunnel, "❌ SSH connection failed - check host, port, and network");
             }
             pthread_mutex_unlock(&manager.mutex);
             
+        // If no immediate errors detected, check the process status
+        if (!has_output || 
+            !(strstr(all_output, "Permission denied") || strstr(all_output, "Connection refused") ||
+              strstr(all_output, "remote port forwarding failed") || strstr(all_output, "bind:"))) {
+            
+            // Give SSH more time to establish, especially for reverse tunnels
+            int wait_time = (tunnel->type == TUNNEL_TYPE_REVERSE) ? 5 : 2;
+            sleep(wait_time);
+            
+            // Check if process is still alive
+            if (ssh_proc) {
+                // Try reading more output after waiting
+                while (fgets(output_buffer, sizeof(output_buffer), ssh_proc)) {
+                    output_buffer[strcspn(output_buffer, "\r\n")] = 0;
+                    if (strlen(output_buffer) > 0) {
+                        char log_msg[1024];
+                        snprintf(log_msg, sizeof(log_msg), "🔍 Delayed SSH output: %s", output_buffer);
+                        log_tunnel_event(tunnel, log_msg);
+                        
+                        // Check for delayed errors
+                        if (strstr(output_buffer, "Warning: remote port forwarding failed") ||
+                            strstr(output_buffer, "bind: Address already in use") ||
+                            strstr(output_buffer, "bind: Cannot assign requested address")) {
+                            pthread_mutex_lock(&manager.mutex);
+                            tunnel->status = TUNNEL_PORT_ERROR;
+                            log_tunnel_event(tunnel, "🔒 Delayed error: Remote port forwarding failed");
+                            pthread_mutex_unlock(&manager.mutex);
+                            
+                            pclose(ssh_proc);
+                            ssh_proc = NULL;
+                            sleep(tunnel->reconnect_delay);
+                            continue;
+                        }
+                    }
+                }
+            }
+        } else {
             pclose(ssh_proc);
             ssh_proc = NULL;
             sleep(tunnel->reconnect_delay);
@@ -876,10 +939,10 @@ void interactive_mode(void) {
     print_status();
     
     printf("%s=== Interactive Command Mode ===%s\n", C_BOLD, C_RESET);
-    printf("Commands: %sstatus%s, %sstart%s [name], %sstop%s [name], %sreset%s <name>, %sadd%s, %stest%s [name], %sdiagnose%s, %swatch%s, %squit%s, %shelp%s\n\n", 
+    printf("Commands: %sstatus%s, %sstart%s [name], %sstop%s [name], %sreset%s <name>, %sadd%s, %stest%s [name], %sdebug%s [name], %sdiagnose%s, %swatch%s, %squit%s, %shelp%s\n\n", 
            C_CYAN, C_RESET, C_GREEN, C_RESET, C_RED, C_RESET, 
            C_MAGENTA, C_RESET, C_BLUE, C_RESET, C_YELLOW, C_RESET,
-           C_CYAN, C_RESET, C_YELLOW, C_RESET, C_MAGENTA, C_RESET, C_BLUE, C_RESET);
+           C_RED, C_RESET, C_CYAN, C_RESET, C_YELLOW, C_RESET, C_MAGENTA, C_RESET, C_BLUE, C_RESET);
     
     while (manager.running) {
         printf("%stunnel%s> ", C_BOLD, C_RESET);
@@ -983,6 +1046,71 @@ void interactive_mode(void) {
             } else {
                 printf("%s❌ Usage: test <tunnel_name>%s\n", C_ERROR, C_RESET);
             }
+        } else if (strcmp(input, "debug") == 0) {
+            printf("%s🐛 Debug: Testing SSH commands for all tunnels%s\n", C_WARNING, C_RESET);
+            pthread_mutex_lock(&manager.mutex);
+            for (int i = 0; i < manager.count; i++) {
+                tunnel_t *tunnel = &manager.tunnels[i];
+                char cmd[MAX_CMD_LEN];
+                
+                printf("\n%s%s [%s]:%s\n", C_CYAN, tunnel->name, 
+                       tunnel->type == TUNNEL_TYPE_REVERSE ? "REVERSE" : "FORWARD", C_RESET);
+                
+                if (tunnel->type == TUNNEL_TYPE_REVERSE) {
+                    snprintf(cmd, sizeof(cmd),
+                            "ssh -i %s -N -R %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no",
+                            tunnel->ssh_key, tunnel->remote_port, tunnel->remote_host, tunnel->local_port,
+                            tunnel->user, tunnel->host, tunnel->port);
+                } else {
+                    snprintf(cmd, sizeof(cmd),
+                            "ssh -i %s -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no",
+                            tunnel->ssh_key, tunnel->local_port, tunnel->remote_host, tunnel->remote_port,
+                            tunnel->user, tunnel->host, tunnel->port);
+                }
+                
+                printf("%s📝 SSH Command:%s\n%s%s%s\n", C_DIM, C_RESET, C_YELLOW, cmd, C_RESET);
+            }
+            pthread_mutex_unlock(&manager.mutex);
+        } else if (strncmp(input, "debug ", 6) == 0) {
+            char *name = input + 6;
+            while (*name == ' ') name++;
+            if (strlen(name) > 0) {
+                pthread_mutex_lock(&manager.mutex);
+                int found = 0;
+                for (int i = 0; i < manager.count; i++) {
+                    tunnel_t *tunnel = &manager.tunnels[i];
+                    if (strcmp(tunnel->name, name) == 0) {
+                        found = 1;
+                        char cmd[MAX_CMD_LEN];
+                        
+                        printf("%s🐛 Debug: SSH command for %s [%s]%s\n", C_WARNING, tunnel->name,
+                               tunnel->type == TUNNEL_TYPE_REVERSE ? "REVERSE" : "FORWARD", C_RESET);
+                        
+                        if (tunnel->type == TUNNEL_TYPE_REVERSE) {
+                            snprintf(cmd, sizeof(cmd),
+                                    "ssh -i %s -N -R %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no",
+                                    tunnel->ssh_key, tunnel->remote_port, tunnel->remote_host, tunnel->local_port,
+                                    tunnel->user, tunnel->host, tunnel->port);
+                        } else {
+                            snprintf(cmd, sizeof(cmd),
+                                    "ssh -i %s -N -L %d:%s:%d %s@%s -p %d -o ConnectTimeout=10 -o ServerAliveInterval=30 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no",
+                                    tunnel->ssh_key, tunnel->local_port, tunnel->remote_host, tunnel->remote_port,
+                                    tunnel->user, tunnel->host, tunnel->port);
+                        }
+                        
+                        printf("%s📝 SSH Command:%s\n%s%s%s\n", C_DIM, C_RESET, C_YELLOW, cmd, C_RESET);
+                        printf("%s💡 Manual test: Copy and run this command to debug manually%s\n", C_INFO, C_RESET);
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&manager.mutex);
+                
+                if (!found) {
+                    printf("%s❌ Tunnel '%s' not found%s\n", C_ERROR, name, C_RESET);
+                }
+            } else {
+                printf("%s❌ Usage: debug <tunnel_name>%s\n", C_ERROR, C_RESET);
+            }
         } else if (strcmp(input, "diagnose") == 0) {
             printf("%s🔧 System Diagnostics%s\n\n", C_BOLD, C_RESET);
             
@@ -1002,6 +1130,27 @@ void interactive_mode(void) {
                 printf("%s❌ Config file '%s' is not accessible: %s%s\n", C_ERROR, CONFIG_FILE, strerror(errno), C_RESET);
             }
             
+            // Count tunnel types
+            int reverse_count = 0, forward_count = 0;
+            pthread_mutex_lock(&manager.mutex);
+            for (int i = 0; i < manager.count; i++) {
+                if (manager.tunnels[i].type == TUNNEL_TYPE_REVERSE) reverse_count++;
+                else forward_count++;
+            }
+            pthread_mutex_unlock(&manager.mutex);
+            
+            printf("\n%sTunnel Type Distribution:%s\n", C_BOLD, C_RESET);
+            printf("  %sForward tunnels (-L):%s %d\n", C_GREEN, C_RESET, forward_count);
+            printf("  %sReverse tunnels (-R):%s %d\n", C_MAGENTA, C_RESET, reverse_count);
+            
+            if (reverse_count > 0) {
+                printf("\n%s⚠️  Reverse Tunnel Requirements:%s\n", C_WARNING, C_RESET);
+                printf("  • Remote server must have '%sGatewayPorts yes%s' in /etc/ssh/sshd_config\n", C_YELLOW, C_RESET);
+                printf("  • Remote ports must be available (not in use)\n");
+                printf("  • Firewall must allow the remote ports\n");
+                printf("  • Use '%ssudo systemctl reload sshd%s' after config changes\n", C_YELLOW, C_RESET);
+            }
+            
             // Check all SSH keys
             printf("\n%sTunnel SSH Key Status:%s\n", C_BOLD, C_RESET);
             pthread_mutex_lock(&manager.mutex);
@@ -1009,7 +1158,8 @@ void interactive_mode(void) {
                 tunnel_t *tunnel = &manager.tunnels[i];
                 struct stat key_stat;
                 
-                printf("  %s%s%s: ", C_CYAN, tunnel->name, C_RESET);
+                printf("  %s%s%s [%s]: ", C_CYAN, tunnel->name, C_RESET, 
+                       tunnel->type == TUNNEL_TYPE_REVERSE ? "REVERSE" : "FORWARD");
                 if (stat(tunnel->ssh_key, &key_stat) == 0) {
                     int perms = key_stat.st_mode & 0777;
                     if (perms <= 0600) {
@@ -1044,6 +1194,8 @@ void interactive_mode(void) {
             printf("  %sadd%s          - Add new tunnel interactively\n", C_BLUE, C_RESET);
             printf("  %stest%s         - Test all tunnel connectivity\n", C_YELLOW, C_RESET);
             printf("  %stest <name>%s  - Test specific tunnel connectivity\n", C_YELLOW, C_RESET);
+            printf("  %sdebug%s        - Show SSH commands for all tunnels\n", C_RED, C_RESET);
+            printf("  %sdebug <name>%s - Show SSH command for specific tunnel\n", C_RED, C_RESET);
             printf("  %sdiagnose%s     - Run system diagnostics\n", C_CYAN, C_RESET);
             printf("  %swatch%s        - Live status updates (refresh every 2s)\n", C_YELLOW, C_RESET);
             printf("  %squit%s         - Exit program\n", C_MAGENTA, C_RESET);
